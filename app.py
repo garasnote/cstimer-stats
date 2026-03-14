@@ -58,6 +58,66 @@ def rolling_average(times_ms, n):
         out[i] = sum(trimmed) / len(trimmed)
     return out
 
+def fit_distributions(times_s):
+    """Fit Log-normal, Ex-Gaussian, Gamma, and Normal. Return dict + best by AIC."""
+    res = {}
+    n   = len(times_s)
+    def aic(ll, k): return 2*k - 2*ll
+    def bic(ll, k): return k*np.log(n) - 2*ll
+
+    # Log-normal
+    try:
+        s, _, sc = stats.lognorm.fit(times_s, floc=0)
+        ll = np.sum(stats.lognorm.logpdf(times_s, s, 0, sc))
+        res['Log-normal'] = dict(
+            dist=stats.lognorm, params=(s, 0, sc), k=2,
+            aic=aic(ll,2), bic=bic(ll,2), ll=ll,
+            color='#88c0d0',
+            label=f"Log-normal (σ={s:.3f}, μ={np.log(sc):.3f})",
+        )
+    except Exception: pass
+
+    # Ex-Gaussian
+    try:
+        K, lo, sc = stats.exponnorm.fit(times_s)
+        ll = np.sum(stats.exponnorm.logpdf(times_s, K, lo, sc))
+        tau = K * sc
+        res['Ex-Gaussian'] = dict(
+            dist=stats.exponnorm, params=(K, lo, sc), k=3,
+            aic=aic(ll,3), bic=bic(ll,3), ll=ll,
+            color='#b48ead',
+            label=f"Ex-Gaussian (μ={lo:.3f}, σ={sc:.3f}, τ={tau:.3f})",
+        )
+    except Exception: pass
+
+    # Gamma
+    try:
+        a, _, sc = stats.gamma.fit(times_s, floc=0)
+        ll = np.sum(stats.gamma.logpdf(times_s, a, 0, sc))
+        res['Gamma'] = dict(
+            dist=stats.gamma, params=(a, 0, sc), k=2,
+            aic=aic(ll,2), bic=bic(ll,2), ll=ll,
+            color='#a3be8c',
+            label=f"Gamma (α={a:.3f}, β={sc:.3f})",
+        )
+    except Exception: pass
+
+    # Normal (always positive values not guaranteed — user's choice)
+    try:
+        mu_n, sig_n = stats.norm.fit(times_s)
+        ll = np.sum(stats.norm.logpdf(times_s, mu_n, sig_n))
+        res['Normal'] = dict(
+            dist=stats.norm, params=(mu_n, sig_n), k=2,
+            aic=aic(ll,2), bic=bic(ll,2), ll=ll,
+            color='#bf616a',
+            label=f"Normal (μ={mu_n:.3f}, σ={sig_n:.3f})",
+        )
+    except Exception: pass
+
+    best = min(res, key=lambda k: res[k]['aic']) if res else None
+    return res, best
+
+
 def parse_sessions(data):
     """Parse cstimer JSON into a dict of DataFrames keyed by session name."""
     session_props = {}
@@ -276,18 +336,10 @@ def compute_stats(df):
     df = df.copy()
     df['running_pb'] = df['eff_ms'].expanding().min()
 
-    # 95% CI over time (rolling window of 12)
-    cis_lo, cis_hi = [], []
-    for i in range(len(df)):
-        window = df['eff_ms'].iloc[max(0,i-11):i+1].dropna().values
-        if len(window) >= 2:
-            m, se = np.mean(window), stats.sem(window)
-            lo, hi = stats.t.interval(0.95, len(window)-1, loc=m, scale=se)
-            cis_lo.append(lo); cis_hi.append(hi)
-        else:
-            cis_lo.append(None); cis_hi.append(None)
-    df['ci_lo'] = cis_lo
-    df['ci_hi'] = cis_hi
+    # 95% CI over time (rolling window of 12) — computed later with chosen dist
+    # Store raw windows for now; CI recalculated per session using selected dist
+    df['ci_lo'] = None
+    df['ci_hi'] = None
     df['ao5']   = ao5
     df['ao12']  = ao12
     df['ao100'] = ao100
@@ -314,6 +366,17 @@ with st.sidebar:
     ao_lines = st.multiselect("Rolling averages to show", ["Ao5","Ao12","Ao100"], default=["Ao5","Ao12"])
     show_ci  = st.checkbox("Show 95% Confidence Interval", value=True)
     show_pb  = st.checkbox("Show PB progression", value=True)
+
+    st.markdown("---")
+    st.header("📐 Distribution Model")
+    dist_choice = st.selectbox(
+        "Model for CI & PB predictor",
+        ["Auto (AIC winner)", "Log-normal", "Ex-Gaussian", "Gamma", "Normal"],
+        index=0,
+        help="Auto picks the best fit by AIC. Normal is included but not recommended — it allows negative times.",
+    )
+    if dist_choice == "Normal":
+        st.warning("⚠️ Normal distribution can predict negative solve times. You've been warned — enjoy!", icon="😬")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 if uploaded:
@@ -374,6 +437,46 @@ for session_name in selected_sessions:
     else:
         continue
 
+    # ── Compute CI using chosen distribution (fast: fit once per window) ───────
+    times_s_ci = df[~df['is_dnf']]['eff_ms'].dropna().values / 1000
+    if len(times_s_ci) >= 3:
+        # Resolve which dist to use for CI — fit on full data once to get chosen
+        fit_res_ci, auto_ci = fit_distributions(times_s_ci)
+        chosen_ci = dist_choice if dist_choice != "Auto (AIC winner)" else auto_ci
+        if chosen_ci not in fit_res_ci:
+            chosen_ci = auto_ci
+        ci_dist = fit_res_ci[chosen_ci]['dist']
+
+        # Map dist name to a fast single-fit function (no full tournament per window)
+        def fast_ci(window_ms):
+            w = window_ms / 1000
+            try:
+                if chosen_ci == 'Log-normal':
+                    s, _, sc = stats.lognorm.fit(w, floc=0)
+                    return ci_dist.ppf(0.025, s, 0, sc)*1000, ci_dist.ppf(0.975, s, 0, sc)*1000
+                elif chosen_ci == 'Ex-Gaussian':
+                    K, lo, sc = stats.exponnorm.fit(w)
+                    return ci_dist.ppf(0.025, K, lo, sc)*1000, ci_dist.ppf(0.975, K, lo, sc)*1000
+                elif chosen_ci == 'Gamma':
+                    a, _, sc = stats.gamma.fit(w, floc=0)
+                    return ci_dist.ppf(0.025, a, 0, sc)*1000, ci_dist.ppf(0.975, a, 0, sc)*1000
+                else:  # Normal
+                    mu, sg = stats.norm.fit(w)
+                    return ci_dist.ppf(0.025, mu, sg)*1000, ci_dist.ppf(0.975, mu, sg)*1000
+            except Exception:
+                return None, None
+
+        cis_lo, cis_hi = [], []
+        for i in range(len(df)):
+            cumulative = df['eff_ms'].iloc[:i+1].dropna().values  # ALL solves so far
+            if len(cumulative) >= 3:
+                lo, hi = fast_ci(cumulative)
+                cis_lo.append(lo); cis_hi.append(hi)
+            else:
+                cis_lo.append(None); cis_hi.append(None)
+        df['ci_lo'] = cis_lo
+        df['ci_hi'] = cis_hi
+
     with tabs[0]:  # ── Overview ─────────────────────────────────────────────
         st.subheader(f"Session: {session_name}")
         c1,c2,c3,c4,c5,c6 = st.columns(6)
@@ -384,13 +487,23 @@ for session_name in selected_sessions:
         c5.metric("Mean",     ms_to_str(int(valid.mean())))
         c6.metric("Std Dev",  f"{valid.std()/1000:.3f}s")
 
-        # ── PB Motivator ─────────────────────────────────────────────────────
+        # ── PB Motivator (uses best-fit distribution) ───────────────────────
         if len(valid) >= 5:
-            mu_v  = valid.mean()
-            sig_v = valid.std()
-            p5  = stats.norm.ppf(0.05, loc=mu_v, scale=sig_v)   # bottom 5%
-            p1  = stats.norm.ppf(0.01, loc=mu_v, scale=sig_v)   # bottom 1%
-            p50 = stats.norm.ppf(0.50, loc=mu_v, scale=sig_v)   # median
+            times_s_ov = valid.values / 1000
+
+            fit_res_ov, auto_best_ov = fit_distributions(times_s_ov)
+
+            # Resolve chosen distribution
+            chosen = dist_choice if dist_choice != "Auto (AIC winner)" else auto_best_ov
+            if chosen not in fit_res_ov:
+                chosen = auto_best_ov
+            best_name_ov   = chosen
+            best_dist_ov   = fit_res_ov[chosen]['dist']
+            best_params_ov = fit_res_ov[chosen]['params']
+
+            p5  = best_dist_ov.ppf(0.05, *best_params_ov) * 1000
+            p1  = best_dist_ov.ppf(0.01, *best_params_ov) * 1000
+            p50 = best_dist_ov.ppf(0.50, *best_params_ov) * 1000
 
             # Only show if the predicted PB is actually better than current PB
             p5_str = ms_to_str(int(max(p5, 1)))
@@ -424,13 +537,13 @@ for session_name in selected_sessions:
             if p5 < pb_single:
                 gap = (pb_single - p5) / 1000
                 st.success(
-                    f"🔥 Based on your {len(valid)} solves, you have a **~5% chance** of beating your PB "
-                    f"({ms_to_str(int(pb_single))}) by **{gap:.2f}s** on any given attempt. "
+                    f"🔥 Based on your {len(valid)} solves ({best_name_ov} fit), you have a **~5% chance** "
+                    f"of beating your PB ({ms_to_str(int(pb_single))}) by **{gap:.2f}s** on any given attempt. "
                     f"Keep grinding — statistically it's coming!"
                 )
             else:
                 st.info(
-                    f"📈 Your PB ({ms_to_str(int(pb_single))}) is already in the top 5% of your distribution. "
+                    f"📈 Your PB ({ms_to_str(int(pb_single))}) is already in the top 5% of your {best_name_ov} distribution. "
                     f"That was a special solve — but with more data the model will refine."
                 )
 
@@ -492,114 +605,140 @@ for session_name in selected_sessions:
         st.subheader(f"Session: {session_name}")
 
         times_s = valid.values / 1000
-        mu_all, sigma_all = np.mean(times_s), np.std(times_s)
-        x_global = np.linspace(max(0, mu_all - 4*sigma_all), mu_all + 4*sigma_all, 300)
+        fit_res, auto_best = fit_distributions(times_s)
 
-        # ── Top row: histogram + final normal curve ──────────────────────────
+        # Resolve chosen distribution
+        chosen_name = dist_choice if dist_choice != "Auto (AIC winner)" else auto_best
+        if chosen_name not in fit_res:
+            chosen_name = auto_best
+
+        # ── Model comparison table ────────────────────────────────────────────
+        st.markdown("#### 📐 Model Fit Comparison")
+        cmp_rows = []
+        for name, r in fit_res.items():
+            tag = "⭐" if name == auto_best else ""
+            tag += " 👈" if name == chosen_name and name != auto_best else ""
+            cmp_rows.append({
+                "Model": tag + " " + name if tag else name,
+                "AIC"  : round(r["aic"], 2),
+                "BIC"  : round(r["bic"], 2),
+                "Log-lik": round(r["ll"], 2),
+                "Params": r["k"],
+            })
+        cmp_df = pd.DataFrame(cmp_rows).sort_values("AIC")
+        st.dataframe(cmp_df, hide_index=True, width='stretch')
+        st.caption("⭐ = AIC winner (recommended)  ·  👈 = your current selection  ·  Lower AIC/BIC = better fit")
+
+        # ── Histogram + all curves ────────────────────────────────────────────
         fig2 = go.Figure()
         fig2.add_trace(go.Histogram(
             x=times_s, nbinsx=20,
-            marker_color='#88c0d0', opacity=0.65,
-            name='All solves', histnorm='probability density',
+            marker_color='#4c566a', opacity=0.6,
+            name='Solves', histnorm='probability density',
         ))
-        fig2.add_trace(go.Scatter(
-            x=x_global, y=stats.norm.pdf(x_global, mu_all, sigma_all),
-            mode='lines', line=dict(color='#ebcb8b', width=2.5),
-            name=f'N(μ={mu_all:.2f}s, σ={sigma_all:.2f}s)',
-        ))
+        x_range = np.linspace(max(0.01, times_s.min() - 1), times_s.max() + 1, 400)
+        for name, r in fit_res.items():
+            is_chosen = (name == chosen_name)
+            y = r['dist'].pdf(x_range, *r['params'])
+            fig2.add_trace(go.Scatter(
+                x=x_range, y=y, mode='lines',
+                line=dict(color=r['color'], width=3 if is_chosen else 1.5,
+                          dash='solid' if is_chosen else 'dash'),
+                name=r['label'] + (" ✓" if is_chosen else ""),
+            ))
         fig2.update_layout(
             xaxis_title='Time (s)', yaxis_title='Density',
-            height=320, plot_bgcolor='rgba(0,0,0,0)',
+            height=360, plot_bgcolor='rgba(0,0,0,0)',
             paper_bgcolor='rgba(0,0,0,0)', font=dict(color='#d8dee9'),
-            legend=dict(orientation='h', y=1.1),
-            margin=dict(t=40, b=40),
+            legend=dict(orientation='h', y=-0.3),
+            margin=dict(t=30, b=100),
         )
         st.plotly_chart(fig2, width='stretch')
 
-        # ── Animated evolving normal ──────────────────────────────────────────
-        st.markdown("**Distribution evolution** — how your normal distribution shifts as solves accumulate")
+        # ── Animated evolving distribution ────────────────────────────────────
+        st.markdown(f"**Distribution evolution** — {chosen_name}{' (not recommended ⚠️)' if chosen_name == 'Normal' else ''}")
 
         if n_solves >= 4:
-            # Build one frame per solve (subsample for performance if large)
             step = max(1, n_solves // 60)
             checkpoints = list(range(3, n_solves + 1, step))
             if checkpoints[-1] != n_solves:
                 checkpoints.append(n_solves)
 
+            # Global x range from final chosen fit
+            try:
+                x_global = np.linspace(
+                    max(0.01, chosen_dist.ppf(0.001, *chosen_params)),
+                    chosen_dist.ppf(0.999, *chosen_params), 300
+                )
+            except Exception:
+                x_global = np.linspace(times_s.min()-1, times_s.max()+1, 300)
+
             anim_frames = []
             for cp in checkpoints:
                 sub_v = df.iloc[:cp][~df.iloc[:cp]['is_dnf']]['eff_ms'].dropna().values / 1000
-                if len(sub_v) < 2:
+                if len(sub_v) < 3:
                     continue
-                mu_i, sig_i = np.mean(sub_v), np.std(sub_v)
-                y_curve = stats.norm.pdf(x_global, mu_i, sig_i)
-                # Get date of the cp-th solve if available
-                date_val = df.iloc[:cp]['timestamp'].dropna()
-                date_str = date_val.iloc[-1].strftime("%b %d, %Y") if len(date_val) > 0 else ""
-                title_str = f"After {cp} solves — μ={mu_i:.3f}s  σ={sig_i:.3f}s" + (f"  ·  {date_str}" if date_str else "")
-                anim_frames.append(go.Frame(
-                    data=[
-                        go.Scatter(x=x_global, y=y_curve,
-                                   fill='toself', fillcolor='rgba(180,142,173,0.25)',
-                                   line=dict(color='#b48ead', width=2.5)),
-                        go.Scatter(x=[mu_i, mu_i],
-                                   y=[0, stats.norm.pdf(mu_i, mu_i, sig_i)],
-                                   mode='lines', line=dict(color='#ebcb8b', dash='dot', width=1.5)),
-                    ],
-                    name=str(cp),
-                    layout=go.Layout(title_text=title_str),
-                ))
+                try:
+                    sub_fits, sub_auto = fit_distributions(sub_v)
+                    sub_name = chosen_name if chosen_name in sub_fits else sub_auto
+                    r_cp = sub_fits[sub_name]
+                    y_curve  = r_cp['dist'].pdf(x_global, *r_cp['params'])
+                    mean_cp  = r_cp['dist'].mean(*r_cp['params'])
+                    date_val = df.iloc[:cp]['timestamp'].dropna()
+                    date_str = date_val.iloc[-1].strftime("%b %d, %Y") if len(date_val) > 0 else ""
+                    mean_v = r_cp['dist'].mean(*r_cp['params'])
+                    var_v  = r_cp['dist'].var(*r_cp['params'])
+                    stats_str = f"μ={mean_v:.3f}s  var={var_v:.4f}s²"
+                    title_str = f"After {cp} solves  ·  {stats_str}" + (f"  ·  {date_str}" if date_str else "")
+                    anim_frames.append(go.Frame(
+                        data=[
+                            go.Scatter(x=x_global, y=y_curve,
+                                       fill='toself', fillcolor='rgba(180,142,173,0.25)',
+                                       line=dict(color=fit_res[chosen_name]['color'], width=2.5)),
+                            go.Scatter(x=[mean_cp, mean_cp],
+                                       y=[0, r_cp['dist'].pdf(mean_cp, *r_cp['params'])],
+                                       mode='lines',
+                                       line=dict(color='#ebcb8b', dash='dot', width=1.5)),
+                        ],
+                        name=str(cp),
+                        layout=go.Layout(title_text=title_str),
+                    ))
+                except Exception:
+                    continue
 
-            # Initial frame
-            sub0 = df.iloc[:checkpoints[0]][~df.iloc[:checkpoints[0]]['is_dnf']]['eff_ms'].dropna().values / 1000
-            mu0, sig0 = np.mean(sub0), np.std(sub0) if len(sub0) > 1 else (sub0[0], 0.1)
-            y0 = stats.norm.pdf(x_global, mu0, sig0)
-
-            fig_anim = go.Figure(
-                data=[
-                    go.Scatter(x=x_global, y=y0,
-                               fill='toself', fillcolor='rgba(180,142,173,0.25)',
-                               line=dict(color='#b48ead', width=2.5), name='Distribution'),
-                    go.Scatter(x=[mu0, mu0], y=[0, stats.norm.pdf(mu0, mu0, sig0)],
-                               mode='lines', line=dict(color='#ebcb8b', dash='dot', width=1.5),
-                               name='Mean'),
-                ],
-                frames=anim_frames,
-            )
-            fig_anim.update_layout(
-                xaxis=dict(title='Time (s)', range=[x_global[0], x_global[-1]]),
-                yaxis=dict(title='Density', rangemode='tozero'),
-                height=360,
-                plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-                font=dict(color='#d8dee9'),
-                showlegend=False,
-                margin=dict(t=50, b=40),
-                title=dict(text=f"After {checkpoints[0]} solves", font=dict(color='#d8dee9', size=13)),
-                updatemenus=[dict(
-                    type='buttons', showactive=False,
-                    y=1.15, x=0.5, xanchor='center',
-                    buttons=[
-                        dict(label='▶  Play',
-                             method='animate',
-                             args=[None, dict(frame=dict(duration=180, redraw=True),
-                                             fromcurrent=True, mode='immediate')]),
-                        dict(label='⏸  Pause',
-                             method='animate',
-                             args=[[None], dict(frame=dict(duration=0, redraw=False),
-                                               mode='immediate')]),
-                    ],
-                )],
-                sliders=[dict(
-                    steps=[dict(method='animate', args=[[str(cp)],
-                                dict(mode='immediate', frame=dict(duration=180, redraw=True))],
-                                label=str(cp)) for cp in checkpoints],
-                    transition=dict(duration=120),
-                    x=0, y=0, len=1.0,
-                    currentvalue=dict(prefix='Solve: ', font=dict(color='#d8dee9')),
-                    font=dict(color='#d8dee9'),
-                )],
-            )
-            st.plotly_chart(fig_anim, width='stretch')
+            if anim_frames:
+                fig_anim = go.Figure(data=anim_frames[0].data, frames=anim_frames)
+                fig_anim.update_layout(
+                    xaxis=dict(title='Time (s)', range=[x_global[0], x_global[-1]]),
+                    yaxis=dict(title='Density', rangemode='tozero'),
+                    height=360,
+                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color='#d8dee9'), showlegend=False,
+                    margin=dict(t=50, b=40),
+                    title=dict(text=anim_frames[0].layout.title.text,
+                               font=dict(color='#d8dee9', size=13)),
+                    updatemenus=[dict(
+                        type='buttons', showactive=False, y=1.15, x=0.5, xanchor='center',
+                        buttons=[
+                            dict(label='▶  Play', method='animate',
+                                 args=[None, dict(frame=dict(duration=180, redraw=True),
+                                                 fromcurrent=True, mode='immediate')]),
+                            dict(label='⏸  Pause', method='animate',
+                                 args=[[None], dict(frame=dict(duration=0, redraw=False),
+                                                   mode='immediate')]),
+                        ],
+                    )],
+                    sliders=[dict(
+                        steps=[dict(method='animate',
+                                    args=[[str(cp)], dict(mode='immediate',
+                                          frame=dict(duration=180, redraw=True))],
+                                    label=str(cp)) for cp in checkpoints],
+                        transition=dict(duration=120), x=0, y=0, len=1.0,
+                        currentvalue=dict(prefix='Solve: ', font=dict(color='#d8dee9')),
+                        font=dict(color='#d8dee9'),
+                    )],
+                )
+                st.plotly_chart(fig_anim, width='stretch')
         else:
             st.info("Need at least 4 solves to animate the distribution evolution.")
 
