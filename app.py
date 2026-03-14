@@ -329,8 +329,8 @@ else:
 if not uploaded and use_demo:
     st.info(
         "👀 **You're viewing demo data** — these are real solves, but they're not yours!  \n"
-        "To see your own stats, export from cstimer: **Export → Export to file** (it's a tiny .txt file), \
-        then upload it using the panel on the left.",
+        "To see your own stats, export from cstimer: **Options → Export** (it's a tiny JSON file, "
+        "usually under 100KB), then upload it using the panel on the left.",
         icon="ℹ️",
     )
 
@@ -384,13 +384,56 @@ for session_name in selected_sessions:
         c5.metric("Mean",     ms_to_str(int(valid.mean())))
         c6.metric("Std Dev",  f"{valid.std()/1000:.3f}s")
 
-        # Current Ao5/Ao12
-        valid_ao5  = [x for x in df['ao5'].dropna()  if x is not None]
-        valid_ao12 = [x for x in df['ao12'].dropna() if x is not None]
-        if valid_ao5:
-            st.metric("Current Ao5",  ms_to_str(int(valid_ao5[-1])))
-        if valid_ao12:
-            st.metric("Current Ao12", ms_to_str(int(valid_ao12[-1])))
+        # ── PB Motivator ─────────────────────────────────────────────────────
+        if len(valid) >= 5:
+            mu_v  = valid.mean()
+            sig_v = valid.std()
+            p5  = stats.norm.ppf(0.05, loc=mu_v, scale=sig_v)   # bottom 5%
+            p1  = stats.norm.ppf(0.01, loc=mu_v, scale=sig_v)   # bottom 1%
+            p50 = stats.norm.ppf(0.50, loc=mu_v, scale=sig_v)   # median
+
+            # Only show if the predicted PB is actually better than current PB
+            p5_str = ms_to_str(int(max(p5, 1)))
+            p1_str = ms_to_str(int(max(p1, 1)))
+
+            st.markdown("---")
+            st.markdown("### 🎯 PB Motivator")
+            st.caption("Based on your current normal distribution — what times are statistically within reach.")
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric(
+                "Median expected",
+                ms_to_str(int(p50)),
+                help="50% of your solves should land around here"
+            )
+            m2.metric(
+                "Top 5% territory",
+                p5_str,
+                delta=f"{(pb_single - p5)/1000:.2f}s better than PB" if p5 < pb_single else "within current PB range",
+                delta_color="inverse",
+                help="There's a ~1 in 20 chance you hit this on any given solve"
+            )
+            m3.metric(
+                "Top 1% territory",
+                p1_str,
+                delta=f"{(pb_single - p1)/1000:.2f}s better than PB" if p1 < pb_single else "within current PB range",
+                delta_color="inverse",
+                help="Rare but statistically possible — ~1 in 100 solves"
+            )
+
+            if p5 < pb_single:
+                gap = (pb_single - p5) / 1000
+                st.success(
+                    f"🔥 Based on your {len(valid)} solves, you have a **~5% chance** of beating your PB "
+                    f"({ms_to_str(int(pb_single))}) by **{gap:.2f}s** on any given attempt. "
+                    f"Keep grinding — statistically it's coming!"
+                )
+            else:
+                st.info(
+                    f"📈 Your PB ({ms_to_str(int(pb_single))}) is already in the top 5% of your distribution. "
+                    f"That was a special solve — but with more data the model will refine."
+                )
+
         st.divider()
 
     with tabs[1]:  # ── Time Series ──────────────────────────────────────────
