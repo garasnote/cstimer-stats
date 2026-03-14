@@ -73,15 +73,29 @@ def parse_sessions(data):
         if not key.startswith("session") or not isinstance(solves, list) or len(solves) == 0:
             continue
         sid = key.replace("session", "")
-        name = str(session_props.get(sid, key))
+        raw_name = session_props.get(sid, key)
+        # sessionData stores numeric names as integers (e.g. name:1 means "Session 1")
+        if isinstance(raw_name, int):
+            name = f"Session {raw_name}"
+        else:
+            name = str(raw_name)
         rows = []
         for idx, s in enumerate(solves):
             try:
-                penalty = s[0]
-                time_ms  = s[1]
-                scramble = s[2]
-                comment  = s[3] if len(s) > 3 else ""
-                ts       = s[4] if len(s) > 4 else None
+                # cstimer has two export formats:
+                # old: [penalty, time_ms, scramble, comment, timestamp]
+                # new: [[penalty, time_ms], scramble, comment, timestamp]
+                if isinstance(s[0], list):
+                    penalty, time_ms = s[0][0], s[0][1]
+                    scramble = s[1]
+                    comment  = s[2] if len(s) > 2 else ""
+                    ts       = s[3] if len(s) > 3 else None
+                else:
+                    penalty  = s[0]
+                    time_ms  = s[1]
+                    scramble = s[2]
+                    comment  = s[3] if len(s) > 3 else ""
+                    ts       = s[4] if len(s) > 4 else None
                 eff      = effective_ms(time_ms, penalty)
                 rows.append({
                     "solve_num" : idx + 1,
@@ -288,7 +302,8 @@ st.caption("Upload your cstimer export (JSON) to explore your solves.")
 # ── Sidebar: file upload ──────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📁 Load Data")
-    uploaded = st.file_uploader("Drop your cstimer JSON export", type=["json","txt"])
+    uploaded = st.file_uploader("Drop your cstimer JSON export", type=["json","txt"],
+                               help="Export from cstimer: Options → Export. File is usually < 100KB.")
     
     # Fall back to embedded demo data
     use_demo = st.checkbox("Use embedded demo data", value=(uploaded is None))
@@ -309,6 +324,15 @@ elif use_demo:
 else:
     st.info("👆 Upload a cstimer JSON export to get started, or check **Use embedded demo data**.")
     st.stop()
+
+# ── Demo warning banner ──────────────────────────────────────────────────────
+if not uploaded and use_demo:
+    st.info(
+        "👀 **You're viewing demo data** — these are real solves, but they're not yours!  \n"
+        "To see your own stats, export from cstimer: **Export → Export to file** (it's a tiny .txt file), \
+        then upload it using the panel on the left.",
+        icon="ℹ️",
+    )
 
 # ── Parse ─────────────────────────────────────────────────────────────────────
 sessions = parse_sessions(raw)
@@ -419,62 +443,122 @@ for session_name in selected_sessions:
             plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
             font=dict(color='#d8dee9'),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with tabs[2]:  # ── Distribution ─────────────────────────────────────────
         st.subheader(f"Session: {session_name}")
 
-        col_a, col_b = st.columns([2,1])
-        with col_a:
-            # Histogram + evolving normal
-            fig2 = go.Figure()
-            times_s = valid.values / 1000
-            fig2.add_trace(go.Histogram(
-                x=times_s, nbinsx=20,
-                marker_color='#88c0d0', opacity=0.7,
-                name='Frequency', histnorm='probability density',
-            ))
+        times_s = valid.values / 1000
+        mu_all, sigma_all = np.mean(times_s), np.std(times_s)
+        x_global = np.linspace(max(0, mu_all - 4*sigma_all), mu_all + 4*sigma_all, 300)
 
-            mu, sigma = np.mean(times_s), np.std(times_s)
-            xr = np.linspace(times_s.min()-1, times_s.max()+1, 300)
-            fig2.add_trace(go.Scatter(
-                x=xr, y=stats.norm.pdf(xr, mu, sigma),
-                mode='lines', line=dict(color='#ebcb8b', width=2.5),
-                name=f'N(μ={mu:.2f}, σ={sigma:.2f})',
-            ))
-            fig2.update_layout(
-                xaxis_title='Time (s)', yaxis_title='Density',
-                height=350, plot_bgcolor='rgba(0,0,0,0)',
-                paper_bgcolor='rgba(0,0,0,0)', font=dict(color='#d8dee9'),
-            )
-            st.plotly_chart(fig2, use_container_width=True)
+        # ── Top row: histogram + final normal curve ──────────────────────────
+        fig2 = go.Figure()
+        fig2.add_trace(go.Histogram(
+            x=times_s, nbinsx=20,
+            marker_color='#88c0d0', opacity=0.65,
+            name='All solves', histnorm='probability density',
+        ))
+        fig2.add_trace(go.Scatter(
+            x=x_global, y=stats.norm.pdf(x_global, mu_all, sigma_all),
+            mode='lines', line=dict(color='#ebcb8b', width=2.5),
+            name=f'N(μ={mu_all:.2f}s, σ={sigma_all:.2f}s)',
+        ))
+        fig2.update_layout(
+            xaxis_title='Time (s)', yaxis_title='Density',
+            height=320, plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)', font=dict(color='#d8dee9'),
+            legend=dict(orientation='h', y=1.1),
+            margin=dict(t=40, b=40),
+        )
+        st.plotly_chart(fig2, width='stretch')
 
-        with col_b:
-            st.markdown("**Evolving Normal Distribution**")
-            solve_slider = st.slider(
-                "Up to solve #", min_value=5, max_value=n_solves,
-                value=n_solves, step=1, key=f"slider_{session_name}",
-            )
-            sub = df.iloc[:solve_slider]
-            sub_valid = sub[~sub['is_dnf']]['eff_ms'].dropna().values / 1000
-            if len(sub_valid) >= 2:
-                mu2, sig2 = np.mean(sub_valid), np.std(sub_valid)
-                fig3 = go.Figure()
-                xr2 = np.linspace(max(0,mu2-4*sig2), mu2+4*sig2, 300)
-                fig3.add_trace(go.Scatter(
-                    x=xr2, y=stats.norm.pdf(xr2, mu2, sig2),
-                    fill='toself', fillcolor='rgba(180,142,173,0.3)',
-                    line=dict(color='#b48ead', width=2),
-                    name=f'N({mu2:.2f}, {sig2:.2f})',
+        # ── Animated evolving normal ──────────────────────────────────────────
+        st.markdown("**Distribution evolution** — how your normal distribution shifts as solves accumulate")
+
+        if n_solves >= 4:
+            # Build one frame per solve (subsample for performance if large)
+            step = max(1, n_solves // 60)
+            checkpoints = list(range(3, n_solves + 1, step))
+            if checkpoints[-1] != n_solves:
+                checkpoints.append(n_solves)
+
+            anim_frames = []
+            for cp in checkpoints:
+                sub_v = df.iloc[:cp][~df.iloc[:cp]['is_dnf']]['eff_ms'].dropna().values / 1000
+                if len(sub_v) < 2:
+                    continue
+                mu_i, sig_i = np.mean(sub_v), np.std(sub_v)
+                y_curve = stats.norm.pdf(x_global, mu_i, sig_i)
+                # Get date of the cp-th solve if available
+                date_val = df.iloc[:cp]['timestamp'].dropna()
+                date_str = date_val.iloc[-1].strftime("%b %d, %Y") if len(date_val) > 0 else ""
+                title_str = f"After {cp} solves — μ={mu_i:.3f}s  σ={sig_i:.3f}s" + (f"  ·  {date_str}" if date_str else "")
+                anim_frames.append(go.Frame(
+                    data=[
+                        go.Scatter(x=x_global, y=y_curve,
+                                   fill='toself', fillcolor='rgba(180,142,173,0.25)',
+                                   line=dict(color='#b48ead', width=2.5)),
+                        go.Scatter(x=[mu_i, mu_i],
+                                   y=[0, stats.norm.pdf(mu_i, mu_i, sig_i)],
+                                   mode='lines', line=dict(color='#ebcb8b', dash='dot', width=1.5)),
+                    ],
+                    name=str(cp),
+                    layout=go.Layout(title_text=title_str),
                 ))
-                fig3.update_layout(
-                    xaxis_title='Time (s)', yaxis_title='Density',
-                    height=280, showlegend=False,
-                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+
+            # Initial frame
+            sub0 = df.iloc[:checkpoints[0]][~df.iloc[:checkpoints[0]]['is_dnf']]['eff_ms'].dropna().values / 1000
+            mu0, sig0 = np.mean(sub0), np.std(sub0) if len(sub0) > 1 else (sub0[0], 0.1)
+            y0 = stats.norm.pdf(x_global, mu0, sig0)
+
+            fig_anim = go.Figure(
+                data=[
+                    go.Scatter(x=x_global, y=y0,
+                               fill='toself', fillcolor='rgba(180,142,173,0.25)',
+                               line=dict(color='#b48ead', width=2.5), name='Distribution'),
+                    go.Scatter(x=[mu0, mu0], y=[0, stats.norm.pdf(mu0, mu0, sig0)],
+                               mode='lines', line=dict(color='#ebcb8b', dash='dot', width=1.5),
+                               name='Mean'),
+                ],
+                frames=anim_frames,
+            )
+            fig_anim.update_layout(
+                xaxis=dict(title='Time (s)', range=[x_global[0], x_global[-1]]),
+                yaxis=dict(title='Density', rangemode='tozero'),
+                height=360,
+                plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='#d8dee9'),
+                showlegend=False,
+                margin=dict(t=50, b=40),
+                title=dict(text=f"After {checkpoints[0]} solves", font=dict(color='#d8dee9', size=13)),
+                updatemenus=[dict(
+                    type='buttons', showactive=False,
+                    y=1.15, x=0.5, xanchor='center',
+                    buttons=[
+                        dict(label='▶  Play',
+                             method='animate',
+                             args=[None, dict(frame=dict(duration=180, redraw=True),
+                                             fromcurrent=True, mode='immediate')]),
+                        dict(label='⏸  Pause',
+                             method='animate',
+                             args=[[None], dict(frame=dict(duration=0, redraw=False),
+                                               mode='immediate')]),
+                    ],
+                )],
+                sliders=[dict(
+                    steps=[dict(method='animate', args=[[str(cp)],
+                                dict(mode='immediate', frame=dict(duration=180, redraw=True))],
+                                label=str(cp)) for cp in checkpoints],
+                    transition=dict(duration=120),
+                    x=0, y=0, len=1.0,
+                    currentvalue=dict(prefix='Solve: ', font=dict(color='#d8dee9')),
                     font=dict(color='#d8dee9'),
-                    title=dict(text=f"μ={mu2:.3f}s  σ={sig2:.3f}s", font=dict(color='#d8dee9')),
-                )
-                st.plotly_chart(fig3, use_container_width=True)
+                )],
+            )
+            st.plotly_chart(fig_anim, width='stretch')
+        else:
+            st.info("Need at least 4 solves to animate the distribution evolution.")
 
     with tabs[3]:  # ── Scramble Viewer ───────────────────────────────────────
         st.subheader(f"Session: {session_name}")
@@ -497,7 +581,7 @@ for session_name in selected_sessions:
 
             cube = scramble_cube(row['scramble'])
             fig_cube = draw_cube_net(cube)
-            st.plotly_chart(fig_cube, use_container_width=False)
+            st.plotly_chart(fig_cube, width='content')
 
             st.caption("Net layout — U on top, L/F/R/B in the middle row, D on the bottom.")
 
@@ -508,17 +592,17 @@ for session_name in selected_sessions:
         if not show_dnf:
             display_df = display_df[~display_df['is_dnf']]
 
+        show_cols = ['solve_num','time_str','penalty','scramble','timestamp','is_dnf','is_plus2']
+        rename = {'solve_num':'#','time_str':'Time','penalty':'Penalty',
+                  'scramble':'Scramble','timestamp':'Date','is_dnf':'DNF','is_plus2':'+2'}
+        table_df = display_df[show_cols].rename(columns=rename)
+
         def style_row(row):
-            if row.is_dnf:
+            if row['DNF']:
                 return ['color: #e06060'] * len(row)
-            elif row.is_plus2:
+            elif row['+2']:
                 return ['color: #f0c060'] * len(row)
             return [''] * len(row)
 
-        show_cols = ['solve_num','time_str','penalty','scramble','timestamp']
-        rename = {'solve_num':'#','time_str':'Time','penalty':'Penalty',
-                  'scramble':'Scramble','timestamp':'Date'}
-        styled = (display_df[show_cols]
-                  .rename(columns=rename)
-                  .style.apply(style_row, axis=1))
-        st.dataframe(styled, use_container_width=True, height=400)
+        styled = table_df.style.apply(style_row, axis=1)
+        st.dataframe(styled, width='stretch', height=400)
